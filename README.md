@@ -18,12 +18,12 @@ We have used the following dataset in our analysis:
 ## Code Files
 You can find the following files in the src folder:
 
-- `train_unet.py` Code used to train semantic segmentation model
+- `train_unet.py` Code used to train the semantic segmentation model
 - `analysis_of_indices.ipynb` The main analysis file used to calculate permutation importance and create all figures in the research paper.
 - `utils.py` Helper file containing functions used to perform the analysis in the main analysis file. 
 
 ## Result Files
 You can find the following files used in the analysis:
 
-- `UNET-SCALE-13MAR23.pth` Final U-Net model whihc is interpreted in this analysis
+- `UNET-SCALE-13MAR23.pth` Final U-Net model which is interpreted in this analysis
 - `Metrics_28MAR23.csv` Contains the permutation importance for different spectral bands and combinations of bands
