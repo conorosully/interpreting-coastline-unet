@@ -23,22 +23,55 @@ from torch.utils.data import DataLoader
 train_path = "../../data/SWED/train/images/" #UPDATE
 save_path = "../../models/{}.pth" #UPDATE
 model_name = sys.argv[1]
-scale = sys.argv[2].lower() == 'true'
+try: 
+    sample = sys.argv[2].lower() == 'true'
+    scale = sys.argv[3].lower() == 'true'
+    clean_data = int(sys.argv[4]) # 0 = no cleaning, 1 = remove missing, 2 = remove incorrect, 3 = remove both, 4 = remove all
+except:
+    sample = False
+    clean_data = 0
+    scale = True
 batch_size = 32 
+
+# Paths for data cleaning 
+missing_data = open("missing_data.txt", "r").read().splitlines() #images with no data
+incorrect = open("incorrect.txt", "r").read().splitlines() #images of water incorrectly labelled as land
+remove = open("remove.txt", "r").read().splitlines() #images to remove for other reasons
+
+missing_data = [train_path + i for i in missing_data]
+incorrect = [train_path + i for i in incorrect]
+remove = [train_path + i for i in remove]
+
+if clean_data == 0:
+    missing_data = []
+    incorrect = []
+    remove = []
+elif clean_data == 1:
+    incorrect = []
+    remove = []
+elif clean_data == 2:
+    missing_data = []
+    remove = []
+elif clean_data == 3:
+    remove = []
+
+
+print("Missing: {}, Incorrect: {}, Remove: {}".format(len(missing_data),len(incorrect),len(remove)))
+print("Sample: {}, Clean: {}, Scale: {}".format(sample,clean_data,scale))
 
 # Classes
 class TrainDataset(torch.utils.data.Dataset):
-    def __init__(self, paths, transforms,scale=False):
+    def __init__(self, paths, transforms, incorrect):
 
         self.paths = paths
         self.transforms = transforms
-        self.scale = scale
+        self.incorrect = incorrect #images of water incorrectly labelled as land
 
     def __getitem__(self, idx):
         """Get image and binary mask for a given index"""
 
         path = self.paths[idx]
-
+            
         if 'train' in path: 
             image, target = self.load_train(path)
         elif 'test' in path: 
@@ -55,7 +88,7 @@ class TrainDataset(torch.utils.data.Dataset):
         # Get target
         mask_path = path.replace("images","labels").replace("image","chip")
         mask = np.load(mask_path)
-        mask = self.transform_mask(mask)
+        mask = self.transform_mask(mask,path)
 
         return image, mask
 
@@ -71,7 +104,7 @@ class TrainDataset(torch.utils.data.Dataset):
         # Get mask
         mask_path = path.replace("images","labels").replace("image","label")
         mask= gdal.Open(mask_path).ReadAsArray()
-        mask = self.transform_mask(mask)
+        mask = self.transform_mask(mask,path)
         
         return image, mask
         
@@ -82,10 +115,11 @@ class TrainDataset(torch.utils.data.Dataset):
         image = np.array(image)
         image = image.astype(np.float32)
 
-        # Scale image
-        if self.scale:
-            for i in range(image.shape[0]):
-                image[i] = cv.normalize(image[i], None, 0, 1, norm_type=cv.NORM_MINMAX)
+        # Scale to 0-1
+        if scale:
+            image = image/10000
+            image = np.clip(image,0,1)
+        
 
         # Convert to tensor
         image = image.transpose(2,0,1)
@@ -93,15 +127,28 @@ class TrainDataset(torch.utils.data.Dataset):
 
         return image
     
-    def transform_mask(self,mask):
+    def transform_mask(self,mask,path):
 
-        """Convert mask to tensor and replace -1 with 0"""
-        mask = np.array(mask).astype(np.int8)
-        mask[np.where(mask == -1)] = 0
-        mask = torch.Tensor(mask)
+        """ 1. Convert mask to tensor and 
+            2. replace -1 with 0
+            3. relabel images incorrectly labelled as land"""
+        
+        # Land = 0, Water = 1
+        mask_1 = np.array(mask).astype(np.int8)
+        mask_1[np.where(mask_1 == -1)] = 0
+
+        # relabel as water 
+        if path in self.incorrect:
+            mask_1 = np.ones(mask_1.shape)
+         
+
+        # Land = 1, Water = 0
+        mask_0 = 1-mask_1
+
+        mask = np.array([mask_0,mask_1])
+        mask = torch.Tensor(mask).squeeze()
 
         return mask
-
 
     def __len__(self):
         return len(self.paths)
@@ -113,54 +160,63 @@ class conv_block(nn.Module):
         self.bn1 = nn.BatchNorm2d(out_c)
         self.conv2 = nn.Conv2d(out_c, out_c, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_c)
-        self.relu = nn.ReLU()
+        self.elu = nn.ELU()
+    
+
     def forward(self, inputs):
-        x = self.conv1(inputs)
-        x = self.bn1(x)
-        x = self.relu(x)
+        #Layer 1
+        x = self.conv1(inputs) #convolution
+        x = self.elu(x) #activation
+        x = self.bn1(x) #normalisation
+        
+        #Layer 2
         x = self.conv2(x)
+        x = self.elu(x)
         x = self.bn2(x)
-        x = self.relu(x)
+        
         return x
 
 class encoder_block(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
-        self.conv = conv_block(in_c, out_c)
-        self.pool = nn.MaxPool2d((2, 2))
+        self.conv = conv_block(in_c, out_c) 
+        self.pool = nn.MaxPool2d((2, 2)) 
     def forward(self, inputs):
-        x = self.conv(inputs)
-        p = self.pool(x)
+        x = self.conv(inputs) #convolutional block
+        p = self.pool(x) #max pooling
         return x, p
 
 class decoder_block(nn.Module):
+
     def __init__(self, in_c, out_c):
         super().__init__()
-        self.up = nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0)
-        self.conv = conv_block(out_c+out_c, out_c)
+        self.up = nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2, padding=0) 
+        self.conv = conv_block(out_c+out_c, out_c) 
+
     def forward(self, inputs, skip):
-        x = self.up(inputs)
+        x = self.up(inputs) #upsampling
         x = torch.cat([x, skip], axis=1)
-        x = self.conv(x)
+        x = self.conv(x) #convolutional block
         return x
 
 class build_unet(nn.Module):
     def __init__(self):
         super().__init__()
         """ Encoder """
-        self.e1 = encoder_block(12, 64)
-        self.e2 = encoder_block(64, 128)
-        self.e3 = encoder_block(128, 256)
-        self.e4 = encoder_block(256, 512)
+        self.e1 = encoder_block(12, 32)
+        self.e2 = encoder_block(32, 64)
+        self.e3 = encoder_block(64, 128)
+        self.e4 = encoder_block(128, 256)
         """ Bottleneck """
-        self.b = conv_block(512, 1024)
+        self.b = conv_block(256, 512)
         """ Decoder """
-        self.d1 = decoder_block(1024, 512)
-        self.d2 = decoder_block(512, 256)
-        self.d3 = decoder_block(256, 128)
-        self.d4 = decoder_block(128, 64)
+        self.d1 = decoder_block(512, 256)
+        self.d2 = decoder_block(256, 128)
+        self.d3 = decoder_block(128, 64)
+        self.d4 = decoder_block(64, 32)
         """ Classifier """
-        self.outputs = nn.Conv2d(64, 1, kernel_size=1, padding=0)
+        self.outputs = nn.Conv2d(32, 2, kernel_size=1, padding=0)
+        self.sm = nn.Softmax(dim=1)
 
     def forward(self, inputs):
         """ Encoder """
@@ -177,7 +233,7 @@ class build_unet(nn.Module):
         d4 = self.d4(d3, s1)
         """ Classifier """
         outputs = self.outputs(d4)
-        outputs = torch.sigmoid(outputs)
+        outputs = self.sm(outputs) 
 
         return outputs
 
@@ -191,24 +247,24 @@ def load_data():
     ])
 
     paths = glob.glob(train_path + "*")
-    paths = random.choices(paths, k=1000)
+    print("Paths before cleaning: {}".format(len(paths)))
+    
+    if sample: 
+        paths = paths[:1000]
 
-    # Remove paths with no data
-    def check_img(path):
-        img = np.load(path)
-        # Check if the image is NOT all zeros
-        test = (np.max(img) + np.min(img) != 0)
-        return test
+    # Remove paths with no data and other errors
+    paths = [path for path in paths if path not in missing_data]
+    paths = [path for path in paths if path not in remove]
 
-    paths = [path for path in paths if check_img(path)]
+    print("Paths after cleaning: {}".format(len(paths)))
 
     # Shuffle the paths
     random.shuffle(paths)
 
     # Create a datasets for training and validation
     split = int(0.9 * len(paths))
-    train_data = TrainDataset(paths[:split], TRANSFORMS)
-    valid_data = TrainDataset(paths[split:], TRANSFORMS)
+    train_data = TrainDataset(paths[:split], TRANSFORMS,incorrect)
+    valid_data = TrainDataset(paths[split:], TRANSFORMS, incorrect)
 
     # Prepare data for Pytorch model
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
@@ -230,7 +286,7 @@ def train_model(train_loader, valid_loader,ephocs=50):
     model.to(device)
     
     # specify loss function (binary cross-entropy)
-    criterion = nn.BCELoss()
+    criterion = nn.CrossEntropyLoss()
 
     # specify optimizer
     optimizer = torch.optim.Adam(model.parameters())
@@ -291,11 +347,21 @@ def train_model(train_loader, valid_loader,ephocs=50):
 
 if __name__ == "__main__":
     print("Training model: {}".format(model_name))
-    print("Scale: {}".format(scale))
+    print("Clean: {}".format(clean_data))
+
+    # Test incorrect
+    if len(incorrect) > 0:
+        test_path = incorrect[100]
+        image, mask = TrainDataset([], None, []).load_train(test_path)
+        print("Before: ", mask[1].min(),mask[1].max())
+        image, mask = TrainDataset([], None, incorrect).load_train(test_path)
+        print("After: ", mask[1].min(),mask[1].max())
 
     # Load data
     train_loader, valid_loader = load_data()
    
     # Train the model
     train_model(train_loader, valid_loader)
+
+
     
