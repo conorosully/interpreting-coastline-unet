@@ -3,7 +3,7 @@ Interpreting a U-Net used for coastal water body segmentation using permutation 
 
 This repository contains the code required to reproduce the results in the conference paper:
 
-> To update
+> O'Sullivan, Conor, et al. "Interpreting a semantic segmentation model for coastline detection." 2023 Photonics & Electromagnetics Research Symposium (PIERS). IEEE, 2023. [	arXiv:2405.11500](https://arxiv.org/abs/2405.11500).
 
 This code is only for academic and research purposes. Please cite the above paper if you intend to use whole/part of the code. 
 
